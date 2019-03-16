@@ -55,7 +55,9 @@ int		*worklist_p, *work_p;		/* list currently being built */
 
 int             joypad[32]; 
 int             joystick1; 
-int             ticcount; 
+volatile int    ticcount; 
+int		netErrors;
+int		errorCounter;
  
 unsigned	branch1, branch2;
  
@@ -97,6 +99,20 @@ extern short video_height;
 extern	short a_vdb, a_vde, a_hdb, a_hde;
 
 unsigned BASEORGY;
+
+char *				/* dst */
+strcpy(dst, src)
+char *dst;
+const char *src;
+{
+register char *dscan = dst;
+register const char *sscan = src;
+
+	while ((*dscan++ = *sscan++) != '\0')
+		continue;
+
+	return(dst);
+}
 
 void Jag68k_main (void)
 {
@@ -1747,6 +1763,8 @@ void I_NetSetup (void)
 	DoubleBufferSetup ();
 	UpdateBuffer ();
 
+	netErrors = 0;
+	errorCounter = 300;
 }
 
 
@@ -1760,13 +1778,19 @@ void I_NetSetup (void)
 
 void G_PlayerReborn (int player);
 
+/* #define PACKET_SIZE 6 */
+#define PACKET_SIZE 15
+
 unsigned I_NetTransfer (unsigned buttons)
 {
 	int		val;
-	byte	inbytes[6];
-	byte	outbytes[6];
+	byte	inbytes[PACKET_SIZE];
+	byte	outbytes[PACKET_SIZE];
 	byte	consistancy;
 	int		i;
+	int	otherconsoleplayer;
+	byte	checksum;
+	byte	injectError = 0;
 	
 /* don't transmit during heavy blitter action */
 #if 0
@@ -1776,21 +1800,40 @@ unsigned I_NetTransfer (unsigned buttons)
 	} while (!junk);
 #endif
 
+
 	outbytes[0] = buttons>>24;
 	outbytes[1] = buttons>>16;
 	outbytes[2] = buttons>>8;
 	outbytes[3] = buttons;
-	
-	consistancy = players[0].mo->x ^ players[0].mo->y ^ players[1].mo->x ^ players[1].mo->y;
-	consistancy = (consistancy>>8) ^ consistancy ^ (consistancy>>16);
-	
+
+	val = players[0].mo->x ^ players[0].mo->y ^ players[1].mo->x ^ players[1].mo->y;
+	val = (val >> 16) ^ val;
+	consistancy = (val>>8) ^ val;
+
 	outbytes[4] = consistancy;
 	outbytes[5] = vblsinframe;
+
+	outbytes[6] = (players[consoleplayer].mo->x >> 24);
+	outbytes[7] = (players[consoleplayer].mo->x >> 16);
+	outbytes[8] = (players[consoleplayer].mo->x >>  8);
+	outbytes[9] = (players[consoleplayer].mo->x);
+
+	outbytes[10] = (players[consoleplayer].mo->y >> 24);
+	outbytes[11] = (players[consoleplayer].mo->y >> 16);
+	outbytes[12] = (players[consoleplayer].mo->y >>  8);
+	outbytes[13] = (players[consoleplayer].mo->y);
+
+	outbytes[14] = 0;
+	
+	for (i=0; i < PACKET_SIZE - 1; i++)
+	{
+		outbytes[14] ^= outbytes[i];
+	}
 	
 	if (consoleplayer)
 	{
 /* player 1 waits before sending */
-		for (i=0 ; i<=5 ; i++)
+		for (i=0; i < PACKET_SIZE; i++)
 		{
 			val = WaitGetSerialChar ();
 			if (val == -1)
@@ -1804,7 +1847,7 @@ unsigned I_NetTransfer (unsigned buttons)
 	else
 	{
 /* player 0 sends first */
-		for (i=0 ; i<=5 ; i++)
+		for (i=0; i < PACKET_SIZE; i++)
 		{
 			PutSerialChar (outbytes[i]);
 			val = WaitGetSerialChar ();
@@ -1813,14 +1856,109 @@ unsigned I_NetTransfer (unsigned buttons)
 			inbytes[i] = val;
 		}
 	}
+
+/*	
+	errorCounter--;
 	
+	if (errorCounter == 0)
+	{
+		errorCounter = 50 * vblsinframe;
+		injectError = 1;
+	}
+
+	PrintNumber (15,12,errorCounter);
+*/
+
 /* */
 /* check for consistancy error */
 /* */
-	if (inbytes[4] != outbytes[4])
+	if ((inbytes[4] != outbytes[4]) || injectError)
+	{
+		injectError = 0;
+		netErrors++;
+		PrintNumber (15,13,netErrors);
+		
+		otherconsoleplayer = consoleplayer ^ 1;
+/*
+		PrintHex (11,14,(players[consoleplayer].mo->x));
+		PrintHex (11,15,(players[consoleplayer].mo->y));
+
+		PrintHex (11,16,(players[otherconsoleplayer].mo->x));
+		PrintHex (11,17,(players[otherconsoleplayer].mo->y));
+
+		PrintHex (11,18, 	((inbytes[6] << 24) |
+					(inbytes[7] << 16) |
+					(inbytes[8] <<  8) |
+					(inbytes[9])));
+		PrintHex (11,19, 	((inbytes[10] << 24) |
+					(inbytes[11] << 16) |
+					(inbytes[12] <<  8) |
+					(inbytes[13])));
+*/		
+		players[otherconsoleplayer].mo->x = 
+					(inbytes[6] << 24) |
+					(inbytes[7] << 16) |
+					(inbytes[8] <<  8) |
+					(inbytes[9]);
+
+		players[otherconsoleplayer].mo->y = 
+					(inbytes[10] << 24) |
+					(inbytes[11] << 16) |
+					(inbytes[12] <<  8) |
+					(inbytes[13]);
+	}
+
+	checksum = 0;
+
+	for (i=0; i < PACKET_SIZE - 1; i++)
+	{
+		checksum ^= inbytes[i];
+	}
+
+/* */
+/* check for UART error resulting in bad checksum */
+/* */
+	if (checksum != inbytes[14])
 	{
 		jagobj_t	*pl;
 	
+		netErrors++;
+		PrintNumber (15,13,netErrors);
+
+		PrintHex (1, 2,  	((outbytes[0] << 24) |
+					(outbytes[1] << 16) |
+					(outbytes[2] <<  8) |
+					(outbytes[3])));
+		PrintHex (1, 3,  	((outbytes[14] << 24) |
+					(outbytes[4] <<  8) |
+					(outbytes[5])));
+	
+		PrintHex (1, 4, 	((outbytes[6] << 24) |
+					(outbytes[7] << 16) |
+					(outbytes[8] <<  8) |
+					(outbytes[9])));
+		PrintHex (1, 5, 	((outbytes[10] << 24) |
+					(outbytes[11] << 16) |
+					(outbytes[12] <<  8) |
+					(outbytes[13])));
+
+		PrintHex (1,16, 	((inbytes[0] << 24) |
+					(inbytes[1] << 16) |
+					(inbytes[2] <<  8) |
+					(inbytes[3])));
+		PrintHex (1,17, 	((inbytes[14] << 24) |
+					(inbytes[4] <<  8) |
+					(inbytes[5])));
+	
+		PrintHex (1,18, 	((inbytes[6] << 24) |
+					(inbytes[7] << 16) |
+					(inbytes[8] <<  8) |
+					(inbytes[9])));
+		PrintHex (1,19, 	((inbytes[10] << 24) |
+					(inbytes[11] << 16) |
+					(inbytes[12] <<  8) |
+					(inbytes[13])));
+
 		S_Clear ();
 		pl = W_CacheLumpName ("neterror", PU_STATIC);	
 		DrawPlaque (pl);
@@ -1829,7 +1967,7 @@ unsigned I_NetTransfer (unsigned buttons)
 		wait (200);
 		goto reconnect;
 	}
-		
+	
 	val = (inbytes[0]<<24) + (inbytes[1]<<16) + (inbytes[2]<<8) + inbytes[3];
 	
 	return val;
